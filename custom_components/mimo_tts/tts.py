@@ -54,7 +54,6 @@ class MimoTTSEntity(TextToSpeechEntity):
         self._attr_name = "Mimo Text-to-Speech"
         self._attr_unique_id = f"{config_entry.entry_id}"
 
-        # 默认语音和语言
         self._default_voice = DEFAULT_VOICE
         self._default_language = DEFAULT_LANGUAGE
 
@@ -98,8 +97,10 @@ class MimoTTSEntity(TextToSpeechEntity):
     @callback
     def async_get_supported_voices(self, language: str) -> list[str] | None:
         """Return a list of supported voices for a language."""
-        # 所有音色对所有语言都可用
-        return list(SUPPORTED_VOICES.keys())
+        # 直接返回所有音色键的列表
+        voices = list(SUPPORTED_VOICES.keys())
+        _LOGGER.debug("Supported voices for %s: %s", language, voices)
+        return voices
 
     async def async_get_tts_audio(
         self,
@@ -107,12 +108,7 @@ class MimoTTSEntity(TextToSpeechEntity):
         language: str,
         options: dict[str, Any] | None = None,
     ) -> TtsAudioType | None:
-        """Get TTS audio for the specified text.
-
-        :param message: Text to synthesize
-        :param language: Language code (BCP47)
-        :param options: Options dict, may contain 'voice' and 'style'
-        """
+        """Get TTS audio for the specified text."""
         _LOGGER.debug(
             "TTS request: language=%s, message=%s, options=%s",
             language,
@@ -120,12 +116,10 @@ class MimoTTSEntity(TextToSpeechEntity):
             options,
         )
 
-        # 语言检查
         if language not in SUPPORTED_LANGUAGES:
             _LOGGER.error("Unsupported language: %s. Using default.", language)
             language = self.default_language
 
-        # 提取语音（从 options 或使用默认）
         voice = self._default_voice
         if options and "voice" in options:
             voice = options["voice"]
@@ -133,16 +127,13 @@ class MimoTTSEntity(TextToSpeechEntity):
                 _LOGGER.error("Unsupported voice: %s. Using default.", voice)
                 voice = self._default_voice
 
-        # 提取风格控制（可选）
         user_content = options.get("style", "") if options else ""
 
-        # 构建消息
         messages = []
         if user_content:
             messages.append({"role": "user", "content": user_content})
         messages.append({"role": "assistant", "content": message})
 
-        # 获取客户端
         client = await self._async_get_client()
 
         try:
@@ -155,9 +146,6 @@ class MimoTTSEntity(TextToSpeechEntity):
                 },
             )
 
-            # 提取音频数据
-            # 根据 Mimo 官方文档，audio 是一个对象，使用 .data 访问
-            # https://mimo.mi.com/docs/zh-CN/api/audio/tts
             if (
                 completion.choices
                 and completion.choices[0].message
