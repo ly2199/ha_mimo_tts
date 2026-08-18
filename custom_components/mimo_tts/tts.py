@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import httpx
+import struct
 import base64
 import logging
 from collections.abc import AsyncGenerator
@@ -68,7 +70,11 @@ class MimoTTSEntity(TextToSpeechEntity):
             api_key = self._api_key
 
             def _create_client():
-                return AsyncOpenAI(api_key=api_key, base_url=MIMO_API_BASE)
+                return AsyncOpenAI(
+                    api_key=api_key,
+                    base_url=MIMO_API_BASE,
+                    timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0),
+                )
 
             self._client = await self.hass.async_add_executor_job(_create_client)
         return self._client
@@ -144,7 +150,7 @@ class MimoTTSEntity(TextToSpeechEntity):
     async def async_stream_tts_audio(
         self, request: TTSAudioRequest
     ) -> TTSAudioResponse | None:
-        """真正的流式 TTS：使用 Mimo stream=True，实时 yield 音频块，并增加缓冲。"""
+        """流式 TTS：使用 Mimo stream=True，输出带 WAV 头的 PCM16 流。"""
         _LOGGER.debug("Stream TTS: language=%s, options=%s", request.language, request.options)
 
         # 收集完整消息（Mimo 不支持文本流式输入）
@@ -177,47 +183,59 @@ class MimoTTSEntity(TextToSpeechEntity):
         messages.append({"role": "assistant", "content": message})
 
         async def stream_generator() -> AsyncGenerator[bytes]:
-            """生成流式音频数据，缓冲后再输出以平滑播放。"""
+            """生成带 WAV 头的 PCM16 流式音频，缓冲后输出。"""
+            header_sent = False
+            buffer = bytearray()
             try:
-                # 使用 MP3 格式流式输出（Mimo 支持）
                 stream = await client.chat.completions.create(
                     model=MIMO_TTS_MODEL,
                     messages=messages,
-                    audio={"format": "mp3", "voice": voice},
+                    audio={"format": "pcm16", "voice": voice},
                     stream=True,
                 )
 
-                buffer = bytearray()
                 async for chunk in stream:
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta
                     audio_data = getattr(delta, "audio", None)
-                    if audio_data is not None:
-                        if isinstance(audio_data, dict):
-                            audio_b64 = audio_data.get("data")
-                        else:
-                            audio_b64 = getattr(audio_data, "data", None)
-                        if audio_b64:
-                            buffer.extend(base64.b64decode(audio_b64))
-                            # 当缓冲区达到设定大小，输出并清空
-                            while len(buffer) >= AUDIO_BUFFER_SIZE:
-                                yield buffer[:AUDIO_BUFFER_SIZE]
-                                buffer = buffer[AUDIO_BUFFER_SIZE:]
+                    if audio_data is None:
+                        continue
+                    if isinstance(audio_data, dict):
+                        audio_b64 = audio_data.get("data")
+                    else:
+                        audio_b64 = getattr(audio_data, "data", None)
+                    if not audio_b64:
+                        continue
 
-                # 发送剩余数据
+                    pcm_data = base64.b64decode(audio_b64)
+                    if not header_sent:
+                        yield _create_wav_header()
+                        header_sent = True
+
+                    buffer.extend(pcm_data)
+                    while len(buffer) >= AUDIO_BUFFER_SIZE:
+                        yield buffer[:AUDIO_BUFFER_SIZE]
+                        buffer = buffer[AUDIO_BUFFER_SIZE:]
+
                 if buffer:
                     yield bytes(buffer)
 
             except Exception as err:
-                _LOGGER.exception("MP3 streaming failed, falling back to 1-shot: %s", err)
-                # 降级到非流式
-                result = await self.async_get_tts_audio(message, request.language, request.options)
-                if result:
-                    _, data = result
-                    yield data
+                _LOGGER.exception("PCM16 streaming failed: %s", err)
+                if not header_sent:
+                    # 尚未发送任何流式数据，可安全降级到单次 WAV
+                    _LOGGER.warning("Falling back to 1-shot TTS")
+                    result = await self.async_get_tts_audio(message, request.language, request.options)
+                    if result:
+                        _, data = result
+                        yield data
+                    else:
+                        _LOGGER.error("Fallback TTS failed")
                 else:
-                    _LOGGER.error("Fallback TTS failed")
+                    # 已发送流式头部，无法降级；只能终止，避免混合音频
+                    _LOGGER.error("Stream failed after sending WAV header; cannot fallback")
                     return
 
-        return TTSAudioResponse("mp3", stream_generator())
+        # 返回扩展名为 "wav"，因为现在我们发送的是合法的 WAV 流
+        return TTSAudioResponse("wav", stream_generator())
