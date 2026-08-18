@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import asyncio
-import httpx
-import struct
 import base64
 import logging
+import struct
 from collections.abc import AsyncGenerator
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI
 
 from homeassistant.components.tts import (
@@ -36,7 +36,34 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 # 音频缓冲大小（字节），适中的大小可减少卡顿且保持低延迟
-AUDIO_BUFFER_SIZE = 4096
+AUDIO_BUFFER_SIZE = 32768
+
+# Mimo PCM16 音频参数（24kHz mono 16-bit，来自官方文档）
+MIMO_SAMPLE_RATE = 24000
+MIMO_CHANNELS = 1
+MIMO_SAMPLE_WIDTH = 2  # 16-bit
+
+
+def _create_wav_header(data_size: int = 0xFFFFFFFF) -> bytes:
+    """创建流式 WAV 文件头（长度未知时使用 0xFFFFFFFF）。"""
+    byte_rate = MIMO_SAMPLE_RATE * MIMO_CHANNELS * MIMO_SAMPLE_WIDTH
+    block_align = MIMO_CHANNELS * MIMO_SAMPLE_WIDTH
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        0xFFFFFFFF,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,  # PCM format
+        MIMO_CHANNELS,
+        MIMO_SAMPLE_RATE,
+        byte_rate,
+        block_align,
+        MIMO_SAMPLE_WIDTH * 8,
+        b"data",
+        0xFFFFFFFF,
+    )
 
 
 async def async_setup_entry(
