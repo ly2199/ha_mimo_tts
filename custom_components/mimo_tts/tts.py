@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import logging
+import re
 import struct
+import wave
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -35,7 +38,10 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# 音频缓冲大小（字节），适中的大小可减少卡顿且保持低延迟
+# ========== 音频参数 ==========
+# 第一句流式使用的小缓冲，降低首字延迟
+FIRST_CHUNK_BUFFER_SIZE = 8192
+# 后续块输出使用的大缓冲，保证稳定
 AUDIO_BUFFER_SIZE = 32768
 
 # Mimo PCM16 音频参数（24kHz mono 16-bit，来自官方文档）
@@ -43,7 +49,15 @@ MIMO_SAMPLE_RATE = 24000
 MIMO_CHANNELS = 1
 MIMO_SAMPLE_WIDTH = 2  # 16-bit
 
+# 分句最小长度，避免过短请求
+MIN_SENTENCE_LEN = 40
+# 后续块合并时的最大字符数（约 200 字符，平衡一致性与延迟）
+MAX_CHUNK_LEN = 200
+# 块间插入静音时长（毫秒）
+SILENCE_DURATION_MS = 250
 
+
+# ========== 辅助函数 ==========
 def _create_wav_header(data_size: int = 0xFFFFFFFF) -> bytes:
     """创建流式 WAV 文件头（长度未知时使用 0xFFFFFFFF）。"""
     byte_rate = MIMO_SAMPLE_RATE * MIMO_CHANNELS * MIMO_SAMPLE_WIDTH
@@ -66,6 +80,46 @@ def _create_wav_header(data_size: int = 0xFFFFFFFF) -> bytes:
     )
 
 
+def _create_silence(duration_ms: int = SILENCE_DURATION_MS) -> bytes:
+    """生成指定时长的静音 PCM16 数据（单声道 16-bit）。"""
+    num_samples = int(MIMO_SAMPLE_RATE * duration_ms / 1000)
+    return b"\x00\x00" * num_samples
+
+
+def _split_sentences(text: str) -> list[str]:
+    """按句子结束标点分割，合并过短句，确保自然分割。"""
+    if not text:
+        return []
+
+    # 按中英文句末标点分割，保留标点
+    parts = re.split(r'(?<=[。！？!?；;])', text)
+    sentences = [p.strip() for p in parts if p.strip()]
+
+    # 合并过短句到前一个句子
+    merged = []
+    for sent in sentences:
+        if merged and len(merged[-1]) < MIN_SENTENCE_LEN:
+            merged[-1] += sent
+        else:
+            merged.append(sent)
+    return merged
+
+
+def _wav_to_pcm16(data: bytes) -> bytes:
+    """从 WAV 数据中提取 PCM16 裸数据（去除文件头）。"""
+    try:
+        with wave.open(io.BytesIO(data), 'rb') as wf:
+            # 仅支持 16-bit PCM 单声道
+            if wf.getsampwidth() != 2 or wf.getnchannels() != 1:
+                _LOGGER.warning("WAV format not PCM16 mono, using raw data")
+                return data
+            return wf.readframes(wf.getnframes())
+    except Exception as err:
+        _LOGGER.warning("Failed to parse WAV, assuming raw PCM16: %s", err)
+        return data
+
+
+# ========== 平台注册 ==========
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -76,6 +130,7 @@ async def async_setup_entry(
     async_add_entities([MimoTTSEntity(hass, config_entry)])
 
 
+# ========== TTS 实体 ==========
 class MimoTTSEntity(TextToSpeechEntity):
     """Mimo TTS entity."""
 
@@ -93,6 +148,7 @@ class MimoTTSEntity(TextToSpeechEntity):
         _LOGGER.debug("Mimo TTS entity initialized")
 
     async def _async_get_client(self) -> AsyncOpenAI:
+        """获取带超时设置的 AsyncOpenAI 客户端（惰性创建）。"""
         if self._client is None:
             api_key = self._api_key
 
@@ -100,12 +156,15 @@ class MimoTTSEntity(TextToSpeechEntity):
                 return AsyncOpenAI(
                     api_key=api_key,
                     base_url=MIMO_API_BASE,
-                    timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0),
+                    timeout=httpx.Timeout(
+                        connect=10.0, read=60.0, write=10.0, pool=10.0
+                    ),
                 )
 
             self._client = await self.hass.async_add_executor_job(_create_client)
         return self._client
 
+    # ===== 属性 =====
     @property
     def default_language(self) -> str | None:
         return self._default_language
@@ -131,13 +190,14 @@ class MimoTTSEntity(TextToSpeechEntity):
             for voice_id, name in SUPPORTED_VOICES.items()
         ]
 
+    # ===== 非流式单次合成（整段文本） =====
     async def async_get_tts_audio(
         self,
         message: str,
         language: str,
         options: dict[str, Any] | None = None,
     ) -> TtsAudioType | None:
-        """单次合成（非流式，用于简短文本来回调）。"""
+        """单次合成（非流式，返回 (扩展名, 音频数据)）。"""
         if language not in SUPPORTED_LANGUAGES:
             language = self.default_language
 
@@ -174,11 +234,53 @@ class MimoTTSEntity(TextToSpeechEntity):
             _LOGGER.exception("TTS 1-shot failed: %s", err)
             return None
 
+    # ===== 辅助：非流式获取句子/块的 PCM16 裸数据 =====
+    async def _async_get_pcm16_for_chunk(
+        self,
+        text: str,
+        voice: str,
+        style: str = "",
+    ) -> bytes:
+        """使用非流式 API 获取一段文本的 PCM16 裸数据（并发调用）。"""
+        client = await self._async_get_client()
+        messages = []
+        if style:
+            messages.append({"role": "user", "content": style})
+        messages.append({"role": "assistant", "content": text})
+
+        try:
+            # 请求 WAV 格式（非流式），后续提取 PCM16
+            completion = await client.chat.completions.create(
+                model=MIMO_TTS_MODEL,
+                messages=messages,
+                audio={"format": "wav", "voice": voice},
+            )
+            if (
+                completion.choices
+                and hasattr(completion.choices[0].message, "audio")
+                and completion.choices[0].message.audio
+            ):
+                audio_b64 = completion.choices[0].message.audio.data
+                if audio_b64:
+                    wav_data = base64.b64decode(audio_b64)
+                    return _wav_to_pcm16(wav_data)
+            return b""
+        except Exception as err:
+            _LOGGER.exception("Non-stream TTS for chunk failed: %s", err)
+            return b""
+
+    # ===== 混合流式主入口 =====
     async def async_stream_tts_audio(
         self, request: TTSAudioRequest
     ) -> TTSAudioResponse | None:
-        """流式 TTS：使用 Mimo stream=True，输出带 WAV 头的 PCM16 流。"""
-        _LOGGER.debug("Stream TTS: language=%s, options=%s", request.language, request.options)
+        """
+        混合流式策略：
+        1. 第一句流式输出（小缓冲低延迟）
+        2. 其余句子合并成 1~2 个块，并发非流式请求
+        3. 块间插入静音提升连贯性
+        4. 整体输出为合法 WAV 流
+        """
+        _LOGGER.debug("Hybrid TTS: language=%s, options=%s", request.language, request.options)
 
         # 收集完整消息（Mimo 不支持文本流式输入）
         message_parts = []
@@ -203,20 +305,52 @@ class MimoTTSEntity(TextToSpeechEntity):
 
         style = request.options.get("style", "") if request.options else ""
 
-        client = await self._async_get_client()
-        messages = []
-        if style:
-            messages.append({"role": "user", "content": style})
-        messages.append({"role": "assistant", "content": message})
+        # 分句
+        sentences = _split_sentences(message)
+        if not sentences:
+            sentences = [message]  # 保底
+        _LOGGER.debug("Split into %d sentences: %s", len(sentences), sentences)
+
+        first_sentence = sentences[0]
+        rest_sentences = sentences[1:]
+
+        # 将剩余句子合并成块（每块不超过 MAX_CHUNK_LEN 字符）
+        rest_chunks = []
+        current_chunk = ""
+        for sent in rest_sentences:
+            if len(current_chunk) + len(sent) <= MAX_CHUNK_LEN:
+                current_chunk += sent
+            else:
+                if current_chunk:
+                    rest_chunks.append(current_chunk)
+                current_chunk = sent
+        if current_chunk:
+            rest_chunks.append(current_chunk)
+
+        _LOGGER.debug("First sentence: %s", first_sentence)
+        _LOGGER.debug("Rest chunks (%d): %s", len(rest_chunks), rest_chunks)
+
+        # 启动后续块的并发非流式任务（如有多块）
+        rest_tasks = [
+            asyncio.create_task(
+                self._async_get_pcm16_for_chunk(chunk, voice, style)
+            )
+            for chunk in rest_chunks
+        ]
 
         async def stream_generator() -> AsyncGenerator[bytes]:
-            """生成带 WAV 头的 PCM16 流式音频，缓冲后输出。"""
+            """生成最终 WAV 流：第一句流式 PCM16 + 后续块 PCM16 拼接。"""
             header_sent = False
-            buffer = bytearray()
+            first_buffer = bytearray()
+
+            # ---- 第一句流式部分（小缓冲）----
             try:
+                client = await self._async_get_client()
                 stream = await client.chat.completions.create(
                     model=MIMO_TTS_MODEL,
-                    messages=messages,
+                    messages=(
+                        [{"role": "user", "content": style}] if style else []
+                    ) + [{"role": "assistant", "content": first_sentence}],
                     audio={"format": "pcm16", "voice": voice},
                     stream=True,
                 )
@@ -240,29 +374,44 @@ class MimoTTSEntity(TextToSpeechEntity):
                         yield _create_wav_header()
                         header_sent = True
 
-                    buffer.extend(pcm_data)
-                    while len(buffer) >= AUDIO_BUFFER_SIZE:
-                        yield buffer[:AUDIO_BUFFER_SIZE]
-                        buffer = buffer[AUDIO_BUFFER_SIZE:]
+                    first_buffer.extend(pcm_data)
+                    while len(first_buffer) >= FIRST_CHUNK_BUFFER_SIZE:
+                        yield first_buffer[:FIRST_CHUNK_BUFFER_SIZE]
+                        first_buffer = first_buffer[FIRST_CHUNK_BUFFER_SIZE:]
 
-                if buffer:
-                    yield bytes(buffer)
+                if first_buffer:
+                    yield bytes(first_buffer)
 
             except Exception as err:
-                _LOGGER.exception("PCM16 streaming failed: %s", err)
+                _LOGGER.exception("First sentence streaming failed: %s", err)
                 if not header_sent:
-                    # 尚未发送任何流式数据，可安全降级到单次 WAV
-                    _LOGGER.warning("Falling back to 1-shot TTS")
-                    result = await self.async_get_tts_audio(message, request.language, request.options)
+                    # 流式完全失败，降级为一次性非流式（完整文本）
+                    _LOGGER.warning("Falling back to full 1-shot")
+                    result = await self.async_get_tts_audio(
+                        message, request.language, request.options
+                    )
                     if result:
                         _, data = result
                         yield data
                     else:
                         _LOGGER.error("Fallback TTS failed")
+                    return
                 else:
-                    # 已发送流式头部，无法降级；只能终止，避免混合音频
-                    _LOGGER.error("Stream failed after sending WAV header; cannot fallback")
+                    _LOGGER.error("Stream failed after WAV header; aborting")
                     return
 
-        # 返回扩展名为 "wav"，因为现在我们发送的是合法的 WAV 流
+            # ---- 后续块输出（带静音间隔）----
+            for idx, task in enumerate(rest_tasks):
+                try:
+                    pcm_data = await task
+                except Exception as err:
+                    _LOGGER.error("Non-stream chunk task failed: %s", err)
+                    pcm_data = b""
+
+                if pcm_data:
+                    # 在块之间插入静音（最后一个块后不插）
+                    if idx < len(rest_tasks) - 1:
+                        yield _create_silence(SILENCE_DURATION_MS)
+                    yield pcm_data
+
         return TTSAudioResponse("wav", stream_generator())
