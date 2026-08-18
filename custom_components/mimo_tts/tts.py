@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import base64
 import logging
+from collections.abc import AsyncGenerator
 from typing import Any
 
 from openai import AsyncOpenAI
 
 from homeassistant.components.tts import (
+    TTSAudioRequest,
+    TTSAudioResponse,
     TextToSpeechEntity,
     TtsAudioType,
+    Voice,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -52,7 +56,7 @@ class MimoTTSEntity(TextToSpeechEntity):
         self._client: AsyncOpenAI | None = None
 
         self._attr_name = "Mimo Text-to-Speech"
-        self._attr_unique_id = f"{config_entry.entry_id}"
+        self._attr_unique_id = f"{config_entry.entry_id}_tts"
 
         self._default_voice = DEFAULT_VOICE
         self._default_language = DEFAULT_LANGUAGE
@@ -60,7 +64,7 @@ class MimoTTSEntity(TextToSpeechEntity):
         _LOGGER.debug("Mimo TTS entity initialized")
 
     async def _async_get_client(self) -> AsyncOpenAI:
-        """异步获取客户端，在 executor 中创建以避免阻塞事件循环。"""
+        """异步获取客户端，在 executor 中创建以避免阻塞事件循环."""
         if self._client is None:
             _LOGGER.debug("Creating AsyncOpenAI client in executor")
             api_key = self._api_key
@@ -95,12 +99,15 @@ class MimoTTSEntity(TextToSpeechEntity):
         return {"voice": self._default_voice}
 
     @callback
-    def async_get_supported_voices(self, language: str) -> list[str] | None:
+    def async_get_supported_voices(self, language: str) -> list[Voice] | None:
         """Return a list of supported voices for a language."""
-        # 直接返回所有音色键的列表
-        voices = list(SUPPORTED_VOICES.keys())
-        _LOGGER.debug("Supported voices for %s: %s", language, voices)
-        return voices
+        if language not in SUPPORTED_LANGUAGES:
+            return None
+        # 返回 Voice 对象列表，前端可显示友好名称
+        return [
+            Voice(voice_id=voice_id, name=name)
+            for voice_id, name in SUPPORTED_VOICES.items()
+        ]
 
     async def async_get_tts_audio(
         self,
@@ -108,9 +115,9 @@ class MimoTTSEntity(TextToSpeechEntity):
         language: str,
         options: dict[str, Any] | None = None,
     ) -> TtsAudioType | None:
-        """Get TTS audio for the specified text."""
+        """Get TTS audio for the specified text (1-shot)."""
         _LOGGER.debug(
-            "TTS request: language=%s, message=%s, options=%s",
+            "TTS request (1-shot): language=%s, message=%s, options=%s",
             language,
             message[:50],
             options,
@@ -120,6 +127,7 @@ class MimoTTSEntity(TextToSpeechEntity):
             _LOGGER.error("Unsupported language: %s. Using default.", language)
             language = self.default_language
 
+        # 提取语音
         voice = self._default_voice
         if options and "voice" in options:
             voice = options["voice"]
@@ -127,8 +135,10 @@ class MimoTTSEntity(TextToSpeechEntity):
                 _LOGGER.error("Unsupported voice: %s. Using default.", voice)
                 voice = self._default_voice
 
+        # 提取风格控制
         user_content = options.get("style", "") if options else ""
 
+        # 构建消息
         messages = []
         if user_content:
             messages.append({"role": "user", "content": user_content})
@@ -167,3 +177,41 @@ class MimoTTSEntity(TextToSpeechEntity):
         except Exception as err:
             _LOGGER.exception("TTS generation failed: %s", err)
             return None
+
+    async def async_stream_tts_audio(
+        self, request: TTSAudioRequest
+    ) -> TTSAudioResponse | None:
+        """Stream synthesized audio chunk by chunk."""
+        _LOGGER.debug(
+            "TTS request (stream): language=%s, options=%s",
+            request.language,
+            request.options,
+        )
+
+        # 收集完整消息（因为 Mimo 不支持真正的流式 TTS 输入）
+        # 但我们可以将生成的音频分块返回
+        message = ""
+        async for chunk in request.message_gen:
+            message += chunk
+
+        if not message:
+            _LOGGER.error("Empty message received")
+            return None
+
+        # 调用 1-shot 方法获取音频
+        result = await self.async_get_tts_audio(
+            message=message,
+            language=request.language,
+            options=request.options,
+        )
+
+        if result is None:
+            return None
+
+        extension, audio_data = result
+
+        # 将完整音频作为单个块返回（流式兼容）
+        async def data_gen() -> AsyncGenerator[bytes]:
+            yield audio_data
+
+        return TTSAudioResponse(extension, data_gen())
