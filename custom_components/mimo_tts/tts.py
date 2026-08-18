@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import logging
-import struct
 from collections.abc import AsyncGenerator
 from typing import Any
 
+import numpy as np
+import soundfile as sf
 from openai import AsyncOpenAI
 
 from homeassistant.components.tts import (
@@ -30,82 +32,13 @@ from .const import (
     SUPPORTED_LANGUAGES,
     DEFAULT_LANGUAGE,
     DEFAULT_VOICE,
-    AUDIO_FORMAT,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-# 分句相关常量
-SENTENCE_DELIMITERS = "。！？!?；;\n\r…"
-SUB_DELIMITERS = "，,、:："
-MAX_CHUNK_CHARS = 500
-MAX_CONCURRENT_REQUESTS = 5
-
-
-def split_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
-    """Split text into chunks at sentence boundaries."""
-    text = text.strip()
-    if not text:
-        return []
-    if len(text) <= max_chars:
-        return [text]
-
-    chunks: list[str] = []
-    start = 0
-    length = len(text)
-    while start < length:
-        end = min(start + max_chars, length)
-        if end < length:
-            cut = -1
-            for delimiters in (SENTENCE_DELIMITERS, SUB_DELIMITERS):
-                for i in range(end - 1, start, -1):
-                    if text[i] in delimiters:
-                        cut = i + 1
-                        break
-                if cut > start:
-                    break
-            end = cut if cut > start else end
-        chunks.append(text[start:end])
-        start = end
-    return chunks
-
-
-def concatenate_wav(fragments: list[bytes]) -> bytes:
-    """Merge multiple WAV fragments into a single valid WAV file."""
-    if not fragments:
-        return b""
-    if len(fragments) == 1:
-        return fragments[0]
-
-    first = fragments[0]
-    data_idx = first.find(b"data")
-    if data_idx == -1:
-        # Fallback: simply concatenate
-        return b"".join(fragments)
-
-    # Prepare header from first fragment (up to "data" + 4 bytes length)
-    header = bytearray(first[: data_idx + 8])
-    total_data = 0
-    data_parts = []
-
-    for frag in fragments:
-        idx = frag.find(b"data")
-        if idx != -1:
-            size = struct.unpack_from("<I", frag, idx + 4)[0]
-            total_data += size
-            data_parts.append(frag[idx + 8 : idx + 8 + size])
-        else:
-            # If no data chunk, treat entire content as PCM (should not happen)
-            total_data += len(frag)
-            data_parts.append(frag)
-
-    # Update RIFF chunk size (total file size - 8)
-    riff_size = 36 + total_data  # 44 - 8 = 36
-    struct.pack_into("<I", header, 4, riff_size)
-    # Update data chunk size
-    struct.pack_into("<I", header, data_idx + 4, total_data)
-
-    return bytes(header) + b"".join(data_parts)
+# Mimo 流式返回 PCM16，采样率 24kHz
+STREAM_SAMPLE_RATE = 24000
+STREAM_AUDIO_FORMAT = "pcm16"
 
 
 async def async_setup_entry(
@@ -164,7 +97,7 @@ class MimoTTSEntity(TextToSpeechEntity):
 
     @property
     def supported_options(self) -> list[str] | None:
-        """Return a list of supported options like voice, style."""
+        """Return a list of supported options."""
         return ["voice", "style"]
 
     @property
@@ -182,120 +115,207 @@ class MimoTTSEntity(TextToSpeechEntity):
             for voice_id, name in SUPPORTED_VOICES.items()
         ]
 
-    async def _synthesize_chunk(
-        self,
-        text: str,
-        voice: str,
-        style: str,
-    ) -> bytes:
-        """Synthesize a single text chunk and return the WAV bytes."""
-        client = await self._async_get_client()
-        messages = []
-        if style:
-            messages.append({"role": "user", "content": style})
-        messages.append({"role": "assistant", "content": text})
-
-        try:
-            completion = await client.chat.completions.create(
-                model=MIMO_TTS_MODEL,
-                messages=messages,
-                audio={
-                    "format": AUDIO_FORMAT,
-                    "voice": voice,
-                },
-            )
-            if (
-                completion.choices
-                and completion.choices[0].message
-                and hasattr(completion.choices[0].message, "audio")
-                and completion.choices[0].message.audio
-            ):
-                audio_b64 = completion.choices[0].message.audio.data
-                if audio_b64:
-                    return base64.b64decode(audio_b64)
-            _LOGGER.error("No audio data in response for chunk: %s", text[:30])
-            raise RuntimeError("Empty audio response")
-        except Exception as err:
-            _LOGGER.exception("Chunk synthesis failed: %s", err)
-            raise
-
     async def async_get_tts_audio(
         self,
         message: str,
         language: str,
         options: dict[str, Any] | None = None,
     ) -> TtsAudioType | None:
-        """Get TTS audio with concurrent chunking for long texts."""
+        """Get TTS audio (1-shot fallback)."""
+        _LOGGER.debug(
+            "TTS 1-shot: language=%s, message=%s",
+            language,
+            message[:50],
+        )
+
         if language not in SUPPORTED_LANGUAGES:
-            _LOGGER.error("Unsupported language: %s. Using default.", language)
+            _LOGGER.error("Unsupported language: %s", language)
             language = self.default_language
 
         voice = self._default_voice
         if options and "voice" in options:
             voice = options["voice"]
             if voice not in SUPPORTED_VOICES:
-                _LOGGER.error("Unsupported voice: %s. Using default.", voice)
+                _LOGGER.error("Unsupported voice: %s", voice)
                 voice = self._default_voice
 
-        style = options.get("style", "") if options else ""
+        user_content = options.get("style", "") if options else ""
 
-        # Split text
-        chunks = split_text(message)
-        if not chunks:
-            _LOGGER.error("Empty text after split")
-            return None
+        messages = []
+        if user_content:
+            messages.append({"role": "user", "content": user_content})
+        messages.append({"role": "assistant", "content": message})
 
-        _LOGGER.debug("Splitted into %d chunks, voice=%s", len(chunks), voice)
+        client = await self._async_get_client()
 
-        # If only one chunk, call directly
-        if len(chunks) == 1:
-            try:
-                audio = await self._synthesize_chunk(chunks[0], voice, style)
-                return (AUDIO_FORMAT, audio)
-            except Exception:
+        try:
+            # 使用流式模式获取音频，但一次性收集所有块
+            completion = await client.chat.completions.create(
+                model=MIMO_TTS_MODEL,
+                messages=messages,
+                audio={
+                    "format": "wav",
+                    "voice": voice,
+                },
+            )
+
+            if (
+                completion.choices
+                and completion.choices[0].message
+                and hasattr(completion.choices[0].message, "audio")
+                and completion.choices[0].message.audio
+            ):
+                audio_data_b64 = completion.choices[0].message.audio.data
+                if not audio_data_b64:
+                    _LOGGER.error("No audio data in response")
+                    return None
+
+                audio_bytes = base64.b64decode(audio_data_b64)
+                _LOGGER.debug("Generated audio of %d bytes", len(audio_bytes))
+                return ("wav", audio_bytes)
+            else:
+                _LOGGER.error("No audio data in response")
                 return None
 
-        # Concurrent requests with semaphore
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-
-        async def _limited_request(chunk: str) -> bytes:
-            async with semaphore:
-                return await self._synthesize_chunk(chunk, voice, style)
-
-        tasks = [_limited_request(chunk) for chunk in chunks]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Check for errors
-        successful = []
-        for idx, result in enumerate(results):
-            if isinstance(result, Exception):
-                _LOGGER.error("Chunk %d failed: %s", idx, result)
-                return None
-            successful.append(result)
-
-        if not successful:
+        except Exception as err:
+            _LOGGER.exception("TTS generation failed: %s", err)
             return None
-
-        # Merge all WAV fragments
-        merged = concatenate_wav(successful)
-        _LOGGER.debug("Merged %d chunks into %d bytes", len(successful), len(merged))
-        return (AUDIO_FORMAT, merged)
 
     async def async_stream_tts_audio(
         self, request: TTSAudioRequest
     ) -> TTSAudioResponse | None:
-        """Stream synthesized audio (legacy compatibility)."""
-        # 由于我们实现了并发合并，这里简单调用一次性方法并流式返回单个块
-        result = await self.async_get_tts_audio(
-            message="".join([chunk async for chunk in request.message_gen]),
-            language=request.language,
-            options=request.options,
+        """Stream synthesized audio chunk by chunk using Mimo stream mode."""
+        _LOGGER.debug(
+            "TTS stream: language=%s, options=%s",
+            request.language,
+            request.options,
         )
-        if result is None:
+
+        # 收集完整消息（HA 传入的是 AsyncGenerator）
+        message_parts = []
+        async for chunk in request.message_gen:
+            message_parts.append(chunk)
+        message = "".join(message_parts)
+
+        if not message:
+            _LOGGER.error("Empty message received")
             return None
-        extension, data = result
 
-        async def data_gen() -> AsyncGenerator[bytes]:
-            yield data
+        if request.language not in SUPPORTED_LANGUAGES:
+            _LOGGER.error("Unsupported language: %s", request.language)
+            return None
 
-        return TTSAudioResponse(extension, data_gen())
+        # 提取语音
+        voice = self._default_voice
+        if request.options and "voice" in request.options:
+            voice = request.options["voice"]
+            if voice not in SUPPORTED_VOICES:
+                _LOGGER.error("Unsupported voice: %s", voice)
+                voice = self._default_voice
+
+        # 提取风格控制
+        user_content = request.options.get("style", "") if request.options else ""
+
+        # 构建消息
+        messages = []
+        if user_content:
+            messages.append({"role": "user", "content": user_content})
+        messages.append({"role": "assistant", "content": message})
+
+        client = await self._async_get_client()
+
+        # 创建异步生成器，流式返回音频块
+        async def audio_stream_generator() -> AsyncGenerator[bytes]:
+            """生成流式音频块."""
+            try:
+                # 使用流式模式，返回 PCM16 格式
+                stream = await client.chat.completions.create(
+                    model=MIMO_TTS_MODEL,
+                    messages=messages,
+                    audio={
+                        "format": STREAM_AUDIO_FORMAT,  # pcm16
+                        "voice": voice,
+                    },
+                    stream=True,
+                )
+
+                # 收集 PCM 块并实时转换为 WAV
+                pcm_chunks: list[bytes] = []
+                total_pcm = b""
+
+                async for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    audio_data = getattr(delta, "audio", None)
+
+                    if audio_data is not None:
+                        # audio_data 是 dict，包含 "data" 字段
+                        if isinstance(audio_data, dict):
+                            pcm_b64 = audio_data.get("data")
+                        else:
+                            # 可能是对象，尝试获取 data 属性
+                            pcm_b64 = getattr(audio_data, "data", None)
+
+                        if pcm_b64:
+                            pcm_bytes = base64.b64decode(pcm_b64)
+                            total_pcm += pcm_bytes
+                            pcm_chunks.append(pcm_bytes)
+                            _LOGGER.debug(
+                                "Received PCM chunk: %d bytes, total: %d",
+                                len(pcm_bytes),
+                                len(total_pcm),
+                            )
+
+                if not total_pcm:
+                    _LOGGER.error("No PCM data received from stream")
+                    return
+
+                # 将 PCM16 转换为 WAV（HA 期望 WAV 格式）
+                # 使用 numpy + soundfile 在 executor 中执行
+                def _convert_pcm_to_wav(pcm_data: bytes) -> bytes:
+                    """将 PCM16 数据转换为 WAV 格式."""
+                    try:
+                        # 转换为 numpy array (int16)
+                        np_pcm = np.frombuffer(pcm_data, dtype=np.int16)
+                        # 归一化到 float32 (-1.0 ~ 1.0)
+                        np_float = np_pcm.astype(np.float32) / 32768.0
+
+                        # 写入内存 WAV
+                        wav_buffer = io.BytesIO()
+                        sf.write(
+                            wav_buffer,
+                            np_float,
+                            STREAM_SAMPLE_RATE,
+                            format="WAV",
+                            subtype="PCM_16",
+                        )
+                        wav_buffer.seek(0)
+                        return wav_buffer.read()
+                    except Exception as e:
+                        _LOGGER.error("PCM to WAV conversion failed: %s", e)
+                        return b""
+
+                # 在 executor 中执行转换（避免阻塞事件循环）
+                wav_data = await self.hass.async_add_executor_job(
+                    _convert_pcm_to_wav, total_pcm
+                )
+
+                if not wav_data:
+                    _LOGGER.error("WAV conversion returned empty data")
+                    return
+
+                _LOGGER.debug(
+                    "Stream complete: %d PCM bytes -> %d WAV bytes",
+                    len(total_pcm),
+                    len(wav_data),
+                )
+
+                # 将完整 WAV 作为单个块返回（HA 会处理播放）
+                yield wav_data
+
+            except Exception as err:
+                _LOGGER.exception("TTS stream failed: %s", err)
+                return
+
+        return TTSAudioResponse("wav", audio_stream_generator())
