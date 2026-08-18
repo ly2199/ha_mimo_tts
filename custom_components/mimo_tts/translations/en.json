@@ -1,0 +1,17 @@
+{
+  "config": {
+    "title": "Mimo Text-to-Speech",
+    "step": {
+      "user": {
+        "title": "Mimo Text-to-Speech",
+        "description": "Enter your Mimo API Key",
+        "data": {
+          "api_key": "API Key"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only one instance is allowed"
+    }
+  }
+}
