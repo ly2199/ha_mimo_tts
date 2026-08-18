@@ -1,8 +1,10 @@
 """Support for Mimo text-to-speech service."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
+import struct
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -32,6 +34,78 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# 分句相关常量
+SENTENCE_DELIMITERS = "。！？!?；;\n\r…"
+SUB_DELIMITERS = "，,、:："
+MAX_CHUNK_CHARS = 500
+MAX_CONCURRENT_REQUESTS = 5
+
+
+def split_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
+    """Split text into chunks at sentence boundaries."""
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: list[str] = []
+    start = 0
+    length = len(text)
+    while start < length:
+        end = min(start + max_chars, length)
+        if end < length:
+            cut = -1
+            for delimiters in (SENTENCE_DELIMITERS, SUB_DELIMITERS):
+                for i in range(end - 1, start, -1):
+                    if text[i] in delimiters:
+                        cut = i + 1
+                        break
+                if cut > start:
+                    break
+            end = cut if cut > start else end
+        chunks.append(text[start:end])
+        start = end
+    return chunks
+
+
+def concatenate_wav(fragments: list[bytes]) -> bytes:
+    """Merge multiple WAV fragments into a single valid WAV file."""
+    if not fragments:
+        return b""
+    if len(fragments) == 1:
+        return fragments[0]
+
+    first = fragments[0]
+    data_idx = first.find(b"data")
+    if data_idx == -1:
+        # Fallback: simply concatenate
+        return b"".join(fragments)
+
+    # Prepare header from first fragment (up to "data" + 4 bytes length)
+    header = bytearray(first[: data_idx + 8])
+    total_data = 0
+    data_parts = []
+
+    for frag in fragments:
+        idx = frag.find(b"data")
+        if idx != -1:
+            size = struct.unpack_from("<I", frag, idx + 4)[0]
+            total_data += size
+            data_parts.append(frag[idx + 8 : idx + 8 + size])
+        else:
+            # If no data chunk, treat entire content as PCM (should not happen)
+            total_data += len(frag)
+            data_parts.append(frag)
+
+    # Update RIFF chunk size (total file size - 8)
+    riff_size = 36 + total_data  # 44 - 8 = 36
+    struct.pack_into("<I", header, 4, riff_size)
+    # Update data chunk size
+    struct.pack_into("<I", header, data_idx + 4, total_data)
+
+    return bytes(header) + b"".join(data_parts)
 
 
 async def async_setup_entry(
@@ -103,48 +177,23 @@ class MimoTTSEntity(TextToSpeechEntity):
         """Return a list of supported voices for a language."""
         if language not in SUPPORTED_LANGUAGES:
             return None
-        # 返回 Voice 对象列表，前端可显示友好名称
         return [
             Voice(voice_id=voice_id, name=name)
             for voice_id, name in SUPPORTED_VOICES.items()
         ]
 
-    async def async_get_tts_audio(
+    async def _synthesize_chunk(
         self,
-        message: str,
-        language: str,
-        options: dict[str, Any] | None = None,
-    ) -> TtsAudioType | None:
-        """Get TTS audio for the specified text (1-shot)."""
-        _LOGGER.debug(
-            "TTS request (1-shot): language=%s, message=%s, options=%s",
-            language,
-            message[:50],
-            options,
-        )
-
-        if language not in SUPPORTED_LANGUAGES:
-            _LOGGER.error("Unsupported language: %s. Using default.", language)
-            language = self.default_language
-
-        # 提取语音
-        voice = self._default_voice
-        if options and "voice" in options:
-            voice = options["voice"]
-            if voice not in SUPPORTED_VOICES:
-                _LOGGER.error("Unsupported voice: %s. Using default.", voice)
-                voice = self._default_voice
-
-        # 提取风格控制
-        user_content = options.get("style", "") if options else ""
-
-        # 构建消息
-        messages = []
-        if user_content:
-            messages.append({"role": "user", "content": user_content})
-        messages.append({"role": "assistant", "content": message})
-
+        text: str,
+        voice: str,
+        style: str,
+    ) -> bytes:
+        """Synthesize a single text chunk and return the WAV bytes."""
         client = await self._async_get_client()
+        messages = []
+        if style:
+            messages.append({"role": "user", "content": style})
+        messages.append({"role": "assistant", "content": text})
 
         try:
             completion = await client.chat.completions.create(
@@ -155,63 +204,98 @@ class MimoTTSEntity(TextToSpeechEntity):
                     "voice": voice,
                 },
             )
-
             if (
                 completion.choices
                 and completion.choices[0].message
                 and hasattr(completion.choices[0].message, "audio")
                 and completion.choices[0].message.audio
             ):
-                audio_data_b64 = completion.choices[0].message.audio.data
-                if not audio_data_b64:
-                    _LOGGER.error("No audio data in response")
-                    return None
+                audio_b64 = completion.choices[0].message.audio.data
+                if audio_b64:
+                    return base64.b64decode(audio_b64)
+            _LOGGER.error("No audio data in response for chunk: %s", text[:30])
+            raise RuntimeError("Empty audio response")
+        except Exception as err:
+            _LOGGER.exception("Chunk synthesis failed: %s", err)
+            raise
 
-                audio_bytes = base64.b64decode(audio_data_b64)
-                _LOGGER.debug("Generated audio of %d bytes", len(audio_bytes))
-                return (AUDIO_FORMAT, audio_bytes)
-            else:
-                _LOGGER.error("No audio data in response: %s", completion)
+    async def async_get_tts_audio(
+        self,
+        message: str,
+        language: str,
+        options: dict[str, Any] | None = None,
+    ) -> TtsAudioType | None:
+        """Get TTS audio with concurrent chunking for long texts."""
+        if language not in SUPPORTED_LANGUAGES:
+            _LOGGER.error("Unsupported language: %s. Using default.", language)
+            language = self.default_language
+
+        voice = self._default_voice
+        if options and "voice" in options:
+            voice = options["voice"]
+            if voice not in SUPPORTED_VOICES:
+                _LOGGER.error("Unsupported voice: %s. Using default.", voice)
+                voice = self._default_voice
+
+        style = options.get("style", "") if options else ""
+
+        # Split text
+        chunks = split_text(message)
+        if not chunks:
+            _LOGGER.error("Empty text after split")
+            return None
+
+        _LOGGER.debug("Splitted into %d chunks, voice=%s", len(chunks), voice)
+
+        # If only one chunk, call directly
+        if len(chunks) == 1:
+            try:
+                audio = await self._synthesize_chunk(chunks[0], voice, style)
+                return (AUDIO_FORMAT, audio)
+            except Exception:
                 return None
 
-        except Exception as err:
-            _LOGGER.exception("TTS generation failed: %s", err)
+        # Concurrent requests with semaphore
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+        async def _limited_request(chunk: str) -> bytes:
+            async with semaphore:
+                return await self._synthesize_chunk(chunk, voice, style)
+
+        tasks = [_limited_request(chunk) for chunk in chunks]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Check for errors
+        successful = []
+        for idx, result in enumerate(results):
+            if isinstance(result, Exception):
+                _LOGGER.error("Chunk %d failed: %s", idx, result)
+                return None
+            successful.append(result)
+
+        if not successful:
             return None
+
+        # Merge all WAV fragments
+        merged = concatenate_wav(successful)
+        _LOGGER.debug("Merged %d chunks into %d bytes", len(successful), len(merged))
+        return (AUDIO_FORMAT, merged)
 
     async def async_stream_tts_audio(
         self, request: TTSAudioRequest
     ) -> TTSAudioResponse | None:
-        """Stream synthesized audio chunk by chunk."""
-        _LOGGER.debug(
-            "TTS request (stream): language=%s, options=%s",
-            request.language,
-            request.options,
-        )
-
-        # 收集完整消息（因为 Mimo 不支持真正的流式 TTS 输入）
-        # 但我们可以将生成的音频分块返回
-        message = ""
-        async for chunk in request.message_gen:
-            message += chunk
-
-        if not message:
-            _LOGGER.error("Empty message received")
-            return None
-
-        # 调用 1-shot 方法获取音频
+        """Stream synthesized audio (legacy compatibility)."""
+        # 由于我们实现了并发合并，这里简单调用一次性方法并流式返回单个块
         result = await self.async_get_tts_audio(
-            message=message,
+            message="".join([chunk async for chunk in request.message_gen]),
             language=request.language,
             options=request.options,
         )
-
         if result is None:
             return None
+        extension, data = result
 
-        extension, audio_data = result
-
-        # 将完整音频作为单个块返回（流式兼容）
         async def data_gen() -> AsyncGenerator[bytes]:
-            yield audio_data
+            yield data
 
         return TTSAudioResponse(extension, data_gen())
