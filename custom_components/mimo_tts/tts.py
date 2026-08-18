@@ -12,7 +12,7 @@ from homeassistant.components.tts import (
     TtsAudioType,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
@@ -86,13 +86,19 @@ class MimoTTSEntity(TextToSpeechEntity):
         return SUPPORTED_LANGUAGES
 
     @property
-    def default_voice(self) -> str | None:
-        """Return the default voice."""
-        return self._default_voice
+    def supported_options(self) -> list[str] | None:
+        """Return a list of supported options like voice, style."""
+        return ["voice", "style"]
 
     @property
-    def supported_voices(self) -> list[str] | None:
-        """Return a list of supported voices."""
+    def default_options(self) -> dict[str, Any] | None:
+        """Return the default options."""
+        return {"voice": self._default_voice}
+
+    @callback
+    def async_get_supported_voices(self, language: str) -> list[str] | None:
+        """Return a list of supported voices for a language."""
+        # 所有音色对所有语言都可用
         return list(SUPPORTED_VOICES.keys())
 
     async def async_get_tts_audio(
@@ -120,12 +126,12 @@ class MimoTTSEntity(TextToSpeechEntity):
             language = self.default_language
 
         # 提取语音（从 options 或使用默认）
-        voice = self.default_voice
+        voice = self._default_voice
         if options and "voice" in options:
             voice = options["voice"]
             if voice not in SUPPORTED_VOICES:
                 _LOGGER.error("Unsupported voice: %s. Using default.", voice)
-                voice = self.default_voice
+                voice = self._default_voice
 
         # 提取风格控制（可选）
         user_content = options.get("style", "") if options else ""
@@ -149,22 +155,25 @@ class MimoTTSEntity(TextToSpeechEntity):
                 },
             )
 
-            # 提取音频数据（对象属性，不是字典）
+            # 提取音频数据
+            # 根据 Mimo 官方文档，audio 是一个对象，使用 .data 访问
+            # https://mimo.mi.com/docs/zh-CN/api/audio/tts
             if (
                 completion.choices
                 and completion.choices[0].message
                 and hasattr(completion.choices[0].message, "audio")
+                and completion.choices[0].message.audio
             ):
-                audio_obj = completion.choices[0].message.audio
-                if audio_obj and hasattr(audio_obj, "data") and audio_obj.data:
-                    audio_bytes = base64.b64decode(audio_obj.data)
-                    _LOGGER.debug("Generated audio of %d bytes", len(audio_bytes))
-                    return (AUDIO_FORMAT, audio_bytes)
-                else:
-                    _LOGGER.error("Audio object missing 'data' attribute: %s", audio_obj)
+                audio_data_b64 = completion.choices[0].message.audio.data
+                if not audio_data_b64:
+                    _LOGGER.error("No audio data in response")
                     return None
+
+                audio_bytes = base64.b64decode(audio_data_b64)
+                _LOGGER.debug("Generated audio of %d bytes", len(audio_bytes))
+                return (AUDIO_FORMAT, audio_bytes)
             else:
-                _LOGGER.error("No audio in response: %s", completion)
+                _LOGGER.error("No audio data in response: %s", completion)
                 return None
 
         except Exception as err:
