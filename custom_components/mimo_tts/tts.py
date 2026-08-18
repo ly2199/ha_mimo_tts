@@ -149,23 +149,22 @@ class MimoTTSEntity(TextToSpeechEntity):
                 },
             )
 
-            # 提取音频数据
+            # 提取音频数据（对象属性，不是字典）
             if (
                 completion.choices
                 and completion.choices[0].message
                 and hasattr(completion.choices[0].message, "audio")
             ):
-                audio_data_b64 = completion.choices[0].message.audio.get("data")
-                if not audio_data_b64:
-                    _LOGGER.error("No audio data in response")
+                audio_obj = completion.choices[0].message.audio
+                if audio_obj and hasattr(audio_obj, "data") and audio_obj.data:
+                    audio_bytes = base64.b64decode(audio_obj.data)
+                    _LOGGER.debug("Generated audio of %d bytes", len(audio_bytes))
+                    return (AUDIO_FORMAT, audio_bytes)
+                else:
+                    _LOGGER.error("Audio object missing 'data' attribute: %s", audio_obj)
                     return None
-
-                audio_bytes = base64.b64decode(audio_data_b64)
-                _LOGGER.debug("Generated audio of %d bytes", len(audio_bytes))
-                # 返回 (扩展名, 数据)
-                return (AUDIO_FORMAT, audio_bytes)
             else:
-                _LOGGER.error("No audio data in response: %s", completion)
+                _LOGGER.error("No audio in response: %s", completion)
                 return None
 
         except Exception as err:
