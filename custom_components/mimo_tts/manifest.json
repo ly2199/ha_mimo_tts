@@ -2,12 +2,12 @@
   "domain": "mimo_tts",
   "name": "Mimo Text-to-Speech",
   "config_flow": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "codeowners": ["@ly2199"],
   "documentation": "https://github.com/ly2199/ha_mimo_tts",
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/ly2199/ha_mimo_tts/issues",
-  "requirements": ["openai>=1.0.0", "numpy>=1.24.0", "soundfile>=0.12.0"],
+  "requirements": ["openai>=1.0.0"],
   "dependencies": ["tts"],
   "after_dependencies": ["assist_pipeline"]
 }
