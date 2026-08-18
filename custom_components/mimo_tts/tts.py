@@ -33,6 +33,9 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# 音频缓冲大小（字节），适中的大小可减少卡顿且保持低延迟
+AUDIO_BUFFER_SIZE = 4096
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -141,7 +144,7 @@ class MimoTTSEntity(TextToSpeechEntity):
     async def async_stream_tts_audio(
         self, request: TTSAudioRequest
     ) -> TTSAudioResponse | None:
-        """真正的流式 TTS：使用 Mimo stream=True，实时 yield 音频块。"""
+        """真正的流式 TTS：使用 Mimo stream=True，实时 yield 音频块，并增加缓冲。"""
         _LOGGER.debug("Stream TTS: language=%s, options=%s", request.language, request.options)
 
         # 收集完整消息（Mimo 不支持文本流式输入）
@@ -174,15 +177,17 @@ class MimoTTSEntity(TextToSpeechEntity):
         messages.append({"role": "assistant", "content": message})
 
         async def stream_generator() -> AsyncGenerator[bytes]:
-            """生成流式音频数据（优先使用 MP3 格式）。"""
+            """生成流式音频数据，缓冲后再输出以平滑播放。"""
             try:
-                # 使用 MP3 格式流式输出（如果 Mimo 支持）
+                # 使用 MP3 格式流式输出（Mimo 支持）
                 stream = await client.chat.completions.create(
                     model=MIMO_TTS_MODEL,
                     messages=messages,
                     audio={"format": "mp3", "voice": voice},
                     stream=True,
                 )
+
+                buffer = bytearray()
                 async for chunk in stream:
                     if not chunk.choices:
                         continue
@@ -194,7 +199,16 @@ class MimoTTSEntity(TextToSpeechEntity):
                         else:
                             audio_b64 = getattr(audio_data, "data", None)
                         if audio_b64:
-                            yield base64.b64decode(audio_b64)
+                            buffer.extend(base64.b64decode(audio_b64))
+                            # 当缓冲区达到设定大小，输出并清空
+                            while len(buffer) >= AUDIO_BUFFER_SIZE:
+                                yield buffer[:AUDIO_BUFFER_SIZE]
+                                buffer = buffer[AUDIO_BUFFER_SIZE:]
+
+                # 发送剩余数据
+                if buffer:
+                    yield bytes(buffer)
+
             except Exception as err:
                 _LOGGER.exception("MP3 streaming failed, falling back to 1-shot: %s", err)
                 # 降级到非流式
