@@ -12,7 +12,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any
 
 import httpx
-from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
 from homeassistant.components.tts import (
     TTSAudioRequest,
@@ -56,6 +56,8 @@ SILENCE_DURATION_MS = 250
 TRAILING_SILENCE_MS = 400
 # 瞬态错误重试次数（含首次尝试）
 RETRY_ATTEMPTS = 2
+# 后续块并发合成的最大并发数（避免触发限流）
+MAX_CONCURRENT_CHUNKS = 3
 
 
 # ========== 辅助函数 ==========
@@ -122,7 +124,7 @@ def _wav_to_pcm16(data: bytes) -> bytes:
 
 def _is_transient_error(err: Exception) -> bool:
     """判断是否为可重试的瞬态网络错误。"""
-    return isinstance(
+    if isinstance(
         err,
         (
             httpx.TimeoutException,
@@ -130,7 +132,19 @@ def _is_transient_error(err: Exception) -> bool:
             APIConnectionError,
             APITimeoutError,
         ),
-    )
+    ):
+        return True
+    # 服务端 5xx 或 429 限流同样可重试
+    if isinstance(err, APIStatusError):
+        return err.status_code == 429 or 500 <= err.status_code < 600
+    return False
+
+
+def _retry_delay(err: Exception, attempt: int) -> float:
+    """计算重试退避延迟（秒）。429 限流使用更长退避。"""
+    if isinstance(err, APIStatusError) and err.status_code == 429:
+        return 1.0 * (attempt + 1)
+    return 0.3 * (attempt + 1)
 
 
 async def _run_with_retry(
@@ -144,13 +158,15 @@ async def _run_with_retry(
         except Exception as err:
             if not _is_transient_error(err) or attempt >= attempts - 1:
                 raise
+            delay = _retry_delay(err, attempt)
             _LOGGER.warning(
-                "Transient API error, retrying (%d/%d): %s",
+                "Transient API error, retrying (%d/%d) in %.1fs: %s",
                 attempt + 1,
                 attempts,
+                delay,
                 err,
             )
-            await asyncio.sleep(0.3 * (attempt + 1))
+            await asyncio.sleep(delay)
     return None
 
 
@@ -177,6 +193,7 @@ class MimoTTSEntity(TextToSpeechEntity):
         self._config_entry = config_entry
         self._api_key: str = config_entry.data[CONF_API_KEY]
         self._client: AsyncOpenAI | None = None
+        self._chunk_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHUNKS)
 
         self._attr_name = "Mimo Text-to-Speech"
         self._attr_unique_id = f"{config_entry.entry_id}_tts"
@@ -311,10 +328,77 @@ class MimoTTSEntity(TextToSpeechEntity):
             return b""
 
         try:
-            return await _run_with_retry(_request)
+            async with self._chunk_semaphore:
+                return await _run_with_retry(_request)
         except Exception as err:
             _LOGGER.exception("Non-stream TTS for chunk failed: %s", err)
             return b""
+
+    # ===== 辅助：流式获取一段文本的 PCM16 裸数据 =====
+    async def _async_stream_pcm16(
+        self,
+        text: str,
+        voice: str,
+        style: str = "",
+    ) -> AsyncGenerator[bytes, None]:
+        """流式获取一段文本的 PCM16 裸数据，失败时回退为非流式全量合成。
+
+        仅在尚未产出任何字节前允许重试/回退；一旦开始产出部分音频，
+        为避免重复/错乱音频，中断后直接结束（由调用方决定后续处理）。
+        """
+        messages = (
+            [{"role": "user", "content": style}] if style else []
+        ) + [{"role": "assistant", "content": text}]
+
+        yielded_any = False
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                client = await self._async_get_client()
+                stream = await client.chat.completions.create(
+                    model=MIMO_TTS_MODEL,
+                    messages=messages,
+                    audio={"format": "pcm16", "voice": voice},
+                    stream=True,
+                )
+
+                async for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    audio_data = getattr(delta, "audio", None)
+                    if audio_data is None:
+                        continue
+                    if isinstance(audio_data, dict):
+                        audio_b64 = audio_data.get("data")
+                    else:
+                        audio_b64 = getattr(audio_data, "data", None)
+                    if not audio_b64:
+                        continue
+                    yielded_any = True
+                    yield base64.b64decode(audio_b64)
+                return
+            except Exception as err:
+                if yielded_any:
+                    _LOGGER.warning("Stream TTS interrupted mid-stream: %s", err)
+                    return
+                if attempt < RETRY_ATTEMPTS - 1 and _is_transient_error(err):
+                    delay = _retry_delay(err, attempt)
+                    _LOGGER.warning(
+                        "Stream TTS failed, retrying (%d/%d) in %.1fs: %s",
+                        attempt + 1,
+                        RETRY_ATTEMPTS,
+                        delay,
+                        err,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                _LOGGER.warning(
+                    "Stream TTS failed, falling back to 1-shot: %s", err
+                )
+                data = await self._async_get_pcm16_for_chunk(text, voice, style)
+                if data:
+                    yield data
+                return
 
     # ===== 混合流式主入口 =====
     async def async_stream_tts_audio(
@@ -322,8 +406,8 @@ class MimoTTSEntity(TextToSpeechEntity):
     ) -> TTSAudioResponse | None:
         """
         混合流式策略：
-        1. 单个句子：一次性合成（一次往返，稳定快速）
-        2. 多句：第一句流式输出（小缓冲低延迟），其余句子合并成块并发合成
+        1. 单句：流式合成（SSE 小缓冲低首字节延迟），失败自动回退非流式
+        2. 多句：第一句流式输出，其余句子合并成块、限流并发合成
         3. 块间插入静音，流尾追加静音防止播放器截断句尾
         4. 整体输出为合法 WAV 流
         """
@@ -381,20 +465,27 @@ class MimoTTSEntity(TextToSpeechEntity):
         if current_chunk:
             rest_chunks.append(current_chunk)
 
-        # ---- 单句快速路径：一次性合成，无 SSE 开销 ----
+        # ---- 单句路径：流式合成，低首字节延迟 ----
         if not rest_chunks:
-            async def single_shot_generator() -> AsyncGenerator[bytes]:
-                pcm_data = await self._async_get_pcm16_for_chunk(
-                    message, voice, style
-                )
-                if not pcm_data:
-                    _LOGGER.error("1-shot TTS failed for single sentence")
+            async def single_stream_generator() -> AsyncGenerator[bytes]:
+                header_sent = False
+                buffer = bytearray()
+                async for pcm in self._async_stream_pcm16(message, voice, style):
+                    if not header_sent:
+                        yield _create_wav_header()
+                        header_sent = True
+                    buffer.extend(pcm)
+                    while len(buffer) >= FIRST_CHUNK_BUFFER_SIZE:
+                        yield bytes(buffer[:FIRST_CHUNK_BUFFER_SIZE])
+                        buffer = buffer[FIRST_CHUNK_BUFFER_SIZE:]
+                if not header_sent:
+                    _LOGGER.error("TTS failed for single sentence")
                     return
-                yield _create_wav_header()
-                yield pcm_data
+                if buffer:
+                    yield bytes(buffer)
                 yield _create_silence(TRAILING_SILENCE_MS)
 
-            return TTSAudioResponse("wav", single_shot_generator())
+            return TTSAudioResponse("wav", single_stream_generator())
 
         # ---- 多句混合路径 ----
         async def stream_generator() -> AsyncGenerator[bytes]:
@@ -409,61 +500,20 @@ class MimoTTSEntity(TextToSpeechEntity):
             ]
 
             try:
-                # ---- 第一句流式部分（小缓冲）----
-                first_failed = False
-                for attempt in range(RETRY_ATTEMPTS):
-                    try:
-                        client = await self._async_get_client()
-                        stream = await client.chat.completions.create(
-                            model=MIMO_TTS_MODEL,
-                            messages=(
-                                [{"role": "user", "content": style}] if style else []
-                            ) + [{"role": "assistant", "content": first_sentence}],
-                            audio={"format": "pcm16", "voice": voice},
-                            stream=True,
-                        )
+                # ---- 第一句流式（小缓冲，低首字节延迟）----
+                async for pcm in self._async_stream_pcm16(
+                    first_sentence, voice, style
+                ):
+                    if not header_sent:
+                        yield _create_wav_header()
+                        header_sent = True
+                    first_buffer.extend(pcm)
+                    while len(first_buffer) >= FIRST_CHUNK_BUFFER_SIZE:
+                        yield bytes(first_buffer[:FIRST_CHUNK_BUFFER_SIZE])
+                        first_buffer = first_buffer[FIRST_CHUNK_BUFFER_SIZE:]
 
-                        async for chunk in stream:
-                            if not chunk.choices:
-                                continue
-                            delta = chunk.choices[0].delta
-                            audio_data = getattr(delta, "audio", None)
-                            if audio_data is None:
-                                continue
-                            if isinstance(audio_data, dict):
-                                audio_b64 = audio_data.get("data")
-                            else:
-                                audio_b64 = getattr(audio_data, "data", None)
-                            if not audio_b64:
-                                continue
-
-                            pcm_data = base64.b64decode(audio_b64)
-                            if not header_sent:
-                                yield _create_wav_header()
-                                header_sent = True
-
-                            first_buffer.extend(pcm_data)
-                            while len(first_buffer) >= FIRST_CHUNK_BUFFER_SIZE:
-                                yield first_buffer[:FIRST_CHUNK_BUFFER_SIZE]
-                                first_buffer = first_buffer[FIRST_CHUNK_BUFFER_SIZE:]
-                        break
-                    except Exception as err:
-                        if (
-                            not header_sent
-                            and attempt < RETRY_ATTEMPTS - 1
-                            and _is_transient_error(err)
-                        ):
-                            _LOGGER.warning(
-                                "First sentence stream failed, retrying: %s", err
-                            )
-                            await asyncio.sleep(0.3 * (attempt + 1))
-                            continue
-                        first_failed = True
-                        _LOGGER.exception("First sentence streaming failed: %s", err)
-                        break
-
-                if first_failed and not header_sent:
-                    # 流式完全失败：整段一次性合成
+                if not header_sent:
+                    # 第一句流式与非流式兜底均失败：整段一次性合成
                     _LOGGER.warning("Falling back to full 1-shot")
                     pcm_data = await self._async_get_pcm16_for_chunk(
                         message, voice, style
